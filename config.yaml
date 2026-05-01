@@ -1,0 +1,49 @@
+# Webhook Bridge 配置文件
+
+# 管理员配置
+admin:
+  password: "admin"
+  enabled: true
+
+# 消息缓存配置
+cache:
+  default_max_messages: 1000
+  max_public_messages: 1000
+  max_token_messages: 500
+  message_ttl: 300
+  clean_interval: 120
+
+# 消息去重TTL（秒）
+deduplication_ttl: 20
+
+# 日志级别 - DEBUG, INFO, WARNING, ERROR, CRITICAL
+log_level: "INFO"
+
+# 日志最大长度
+log_maxlen: 2000
+
+# 不缓存的密钥列表
+no_cache_secrets:
+
+# 服务监听端口
+port: 8000
+
+# 原始消息记录配置
+raw_content:
+  enabled: false
+  path: "logs"
+
+# SSL配置
+ssl:
+  ssl_keyfile: ""
+  ssl_certfile: ""
+
+# 统计信息配置
+stats:
+  write_interval: 5
+
+# Webhook二次转发配置 (按AppID索引)
+webhook_forward:
+  enabled: true
+  timeout: 5
+  targets:

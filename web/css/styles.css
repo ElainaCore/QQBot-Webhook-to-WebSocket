@@ -1,7 +1,0 @@
-/* WebSocket代理服务 - 通用样式 */
-/* 主要样式已内联在HTML中，此文件保留用于扩展 */
-
-:root {
-    --theme-gradient: linear-gradient(135deg, #5865F2, #7289DA);
-    --theme-color: #5865F2;
-}
