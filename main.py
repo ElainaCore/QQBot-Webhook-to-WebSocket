@@ -17,6 +17,7 @@ app = create_app()
 
 if __name__ == "__main__":
     import uvicorn
+    logging.getLogger("uvicorn.error").setLevel(logging.ERROR)
     ssl_cfg = config.ssl
     use_ssl = ssl_cfg.get("ssl_keyfile") and ssl_cfg.get("ssl_certfile")
     uvicorn_cfg = uvicorn.Config(app, host="0.0.0.0", port=config.port,
