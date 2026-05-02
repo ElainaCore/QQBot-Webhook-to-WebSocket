@@ -139,6 +139,7 @@ def create_app() -> FastAPI:
 
     # Vue SPA catch-all — /web 及 /web/... 均返回 index.html
     @application.get("/web")
+    @application.get("/web/")
     @application.get("/web/{path:path}")
     async def serve_spa(request: Request, path: str = ""):
         index = os.path.join(WEB_DIR, "index.html")
