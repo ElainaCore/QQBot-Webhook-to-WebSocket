@@ -7,12 +7,12 @@ import time
 from datetime import datetime
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
-from pydantic import BaseModel
+from fastapi.responses import Response
 
 from modules.core.config import config
 from modules.data.cache import cache_manager
 from modules.net.connections import (active_connections, forward_webhook,
-                                     send_to_all, service_health)
+                                     send_to_all)
 from modules.util.privacy import PrivacyUtils
 from modules.data.stats import stats_manager
 from modules.data.appid import app_id_manager
@@ -21,12 +21,8 @@ from modules.util.helpers import generate_signature
 router = APIRouter(tags=["webhook"])
 
 
-class Payload(BaseModel):
-    d: dict
-
-
 @router.post("/webhook")
-async def handle_webhook(request: Request, payload: Payload,
+async def handle_webhook(request: Request,
                          user_agent: str = Header(None),
                          x_bot_appid: str = Header(None)):
     start_time = time.time()
@@ -38,7 +34,8 @@ async def handle_webhook(request: Request, payload: Payload,
 
     stats_manager.increment_message_count()
 
-    # 消息去重
+    # 消息去重 (解析一次, 后续复用)
+    msg_data = None
     try:
         msg_data = json.loads(body)
         msg_id = msg_data.get('id')
@@ -50,24 +47,25 @@ async def handle_webhook(request: Request, payload: Payload,
         pass
 
     # 签名验证回调
-    if "event_ts" in payload.d and "plain_token" in payload.d:
+    d = msg_data.get("d") if isinstance(msg_data, dict) else None
+    if isinstance(d, dict) and "event_ts" in d and "plain_token" in d:
         try:
-            result = generate_signature(secret, payload.d["event_ts"],
-                                        payload.d["plain_token"])
-            service_health["last_successful_webhook"] = time.time()
+            result = generate_signature(secret, d["event_ts"], d["plain_token"])
             return result
         except Exception as e:
             logging.error(f"签名错误: {e}")
             return {"status": "error"}
 
-    # Webhook 二次转发 (按AppID匹配)
+    # Webhook 二次转发 (按AppID匹配) — 同步等待一次尝试, 失败进后台重发队列
+    downstream_resp = None
+    headers = dict(request.headers)
     if config.webhook_forward['enabled'] and config.webhook_forward['targets']:
         appid_for_forward = x_bot_appid or request.query_params.get('appid', '')
         if appid_for_forward:
-            await _forward_to_webhooks(appid_for_forward, body, dict(request.headers))
+            downstream_resp = await _forward_to_webhooks(appid_for_forward, body, headers)
 
     # WebSocket 转发
-    enhanced_body = _add_http_context(body, request)
+    enhanced_body = _add_http_context(body, request, msg_data, headers)
     skip_cache = secret in config.no_cache_secrets
     has_online = secret in active_connections and active_connections[secret]
 
@@ -85,12 +83,15 @@ async def handle_webhook(request: Request, payload: Payload,
         logging.warning(f"Webhook处理耗时: {elapsed:.2f}s | "
                         f"密钥:{PrivacyUtils.sanitize_secret(secret)}")
 
-    service_health["last_successful_webhook"] = time.time()
+    if downstream_resp is not None:
+        return Response(content=downstream_resp['body'],
+                        status_code=downstream_resp['status'],
+                        media_type=downstream_resp['content_type'])
     return {"status": "success"}
 
 
 @router.post("/api/{appid}")
-async def handle_appid_webhook(appid: str, request: Request, payload: Payload,
+async def handle_appid_webhook(appid: str, request: Request,
                                user_agent: str = Header(None),
                                x_bot_appid: str = Header(None),
                                signature: str = Query(None),
@@ -103,7 +104,7 @@ async def handle_appid_webhook(appid: str, request: Request, payload: Payload,
             and not app_id_manager.verify_signature(appid, signature, timestamp, nonce)):
         raise HTTPException(status_code=403, detail="签名验证失败")
     request.query_params._dict["secret"] = secret
-    return await handle_webhook(request=request, payload=payload,
+    return await handle_webhook(request=request,
                                 user_agent=user_agent, x_bot_appid=x_bot_appid)
 
 
@@ -131,6 +132,7 @@ def _log_raw_message(request, body, secret, user_agent, x_bot_appid):
 
 
 async def _forward_to_webhooks(appid, body, headers):
+    """返回首个成功目标的下游响应 (用于原样回复开放平台), 无成功则返回 None"""
     try:
         results = await forward_webhook(
             config.webhook_forward['targets'], body, headers,
@@ -145,10 +147,10 @@ async def _forward_to_webhooks(appid, body, headers):
                 retry = r.get('retry_count', 0)
                 dur = r.get('duration', 0)
                 if retry:
-                    logging.info(f"{ts} - Webhook转发成功 | AppID:{appid} | "
-                                 f"耗时:{dur}s | 重试:{retry}次")
+                    logging.debug(f"{ts} - Webhook转发成功 | AppID:{appid} | "
+                                  f"耗时:{dur}s | 重试:{retry}次")
                 else:
-                    logging.info(f"{ts} - Webhook转发成功 | AppID:{appid} | 耗时:{dur}s")
+                    logging.debug(f"{ts} - Webhook转发成功 | AppID:{appid} | 耗时:{dur}s")
             else:
                 fail += 1
                 err = r.get('error', '未知')
@@ -160,16 +162,23 @@ async def _forward_to_webhooks(appid, body, headers):
                     logging.error(f"{ts} - Webhook转发失败 | AppID:{appid} | 错误:{err}")
         secret_for_stats = app_id_manager.get_secret_by_appid(appid) or appid
         stats_manager.batch_update_wh_stats(secret_for_stats, success, fail)
+        for r in results:
+            if r.get('success') and r.get('body') is not None:
+                return r
     except Exception as e:
         logging.error(f"Webhook转发异常: {e}")
+    return None
 
 
-def _add_http_context(body, request):
+def _add_http_context(body, request, data=None, headers=None):
     try:
-        data = json.loads(body)
+        if data is None:
+            data = json.loads(body)
         if 'http_context' not in data:
+            data = dict(data)
             data['http_context'] = {
-                'headers': dict(request.headers), 'path': request.url.path,
+                'headers': headers if headers is not None else dict(request.headers),
+                'path': request.url.path,
                 'method': request.method, 'url': str(request.url),
                 'remote_addr': request.client.host if request.client else 'unknown',
             }

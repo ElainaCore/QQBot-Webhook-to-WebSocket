@@ -17,6 +17,11 @@ app = create_app()
 
 if __name__ == "__main__":
     import uvicorn
+    try:
+        import uvloop
+        uvloop.install()
+    except ImportError:
+        pass
     class _InvalidHttpFilter(logging.Filter):
         def filter(self, record):
             return "Invalid HTTP request" not in record.getMessage()

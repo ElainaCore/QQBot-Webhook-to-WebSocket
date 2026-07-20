@@ -15,9 +15,8 @@ from fastapi.staticfiles import StaticFiles
 from modules.core.config import config
 from modules.data import database as db
 from modules.data.cache import cache_manager
-from modules.net.connections import active_connections, close_http_session
+from modules.net.connections import active_connections, close_http_session, retry_queue_worker
 from modules.core.session import valid_sessions, load_from_db as load_session_data
-from modules.net.monitoring import monitor_service_health
 from modules.data.stats import stats_manager
 from modules.data.appid import app_id_manager
 from modules.util.helpers import setup_logger
@@ -78,14 +77,16 @@ async def lifespan(application: FastAPI):
     load_session_data()
     app_id_manager.load_from_db()
     stats_manager.start_write_thread()
-    config.start_watcher()
 
     tasks = [
-        asyncio.create_task(monitor_service_health()),
         asyncio.create_task(_cleanup_memory()),
         asyncio.create_task(_stats_flush_loop()),
+        asyncio.create_task(retry_queue_worker()),
     ]
     cache_manager.start_cleaning_thread()
+
+    if config.admin.get("enabled") and config.admin.get("password") in ("", "admin", "123456", "password"):
+        logger.warning("管理员密码为默认/弱密码，请尽快在 config.yaml 中修改 admin.password")
 
     ssl_cfg = config.ssl
     use_ssl = ssl_cfg.get("ssl_keyfile") and ssl_cfg.get("ssl_certfile")
@@ -114,7 +115,7 @@ async def lifespan(application: FastAPI):
 
 def create_app() -> FastAPI:
     application = FastAPI(lifespan=lifespan, log_level="info")
-    application.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
+    application.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False,
                                allow_methods=["*"], allow_headers=["*"])
 
     # 注册路由

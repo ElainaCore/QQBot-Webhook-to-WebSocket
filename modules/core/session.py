@@ -11,6 +11,7 @@ from typing import Dict, Optional
 
 from fastapi import HTTPException, Request, status
 
+from modules.core.config import config
 from modules.data import database as db
 
 COOKIE_NAME = "admin_session"
@@ -36,11 +37,14 @@ def load_from_db():
 # ========== IP 管理 ==========
 
 def get_real_ip(request: Request) -> str:
-    forwarded = request.headers.get('X-Forwarded-For')
-    if forwarded:
-        return forwarded.split(',')[0].strip()
-    real_ip = request.headers.get('X-Real-IP')
-    return real_ip.strip() if real_ip else (request.client.host if request.client else 'unknown')
+    if config.trust_proxy:
+        forwarded = request.headers.get('X-Forwarded-For')
+        if forwarded:
+            return forwarded.split(',')[0].strip()
+        real_ip = request.headers.get('X-Real-IP')
+        if real_ip:
+            return real_ip.strip()
+    return request.client.host if request.client else 'unknown'
 
 
 def record_ip_access(ip: str, success: bool = True):

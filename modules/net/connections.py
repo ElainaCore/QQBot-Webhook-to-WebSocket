@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import time
+from collections import deque
 from typing import Dict, List
 
 import aiohttp
@@ -16,17 +17,10 @@ from modules.data.stats import stats_manager
 # 全局状态
 active_connections: Dict[str, Dict] = {}
 
-service_health = {
-    "last_successful_webhook": 0,
-    "last_successful_ws_message": 0,
-    "error_count": 0,
-    "high_load_detected": False,
-}
-
 # 常量
 PUSH_TIMEOUT = 10
 RETRY_INTERVAL = 1
-MAX_RETRY_TIME = 180
+MAX_RETRY_TIME = 300
 MAX_CONNECTIONS = 500
 
 _http_session: aiohttp.ClientSession = None
@@ -71,102 +65,63 @@ async def send_to_all(secret: str, data: bytes) -> bool:
         *[_send_to_one(ws, data, info, secret) for ws, info in items],
         return_exceptions=True)
 
-    ok = fail = sandbox_ok = 0
+    ok = fail = 0
     for r in results:
         if isinstance(r, Exception) or r is None:
             continue
-        sent, is_sb = r
-        if sent:
+        if r:
             ok += 1
-            if is_sb:
-                sandbox_ok += 1
         else:
             fail += 1
 
     if ok or fail:
         stats_manager.batch_update_ws_stats(secret, ok, fail)
 
-    sanitized = PrivacyUtils.sanitize_secret(secret)
     if ok:
-        parts = [f"WS转发成功 | 密钥:{sanitized} | {ok}/{len(items)}"]
-        if sandbox_ok:
-            parts.append(f"沙盒:{sandbox_ok}")
-        formal = ok - sandbox_ok
-        if formal:
-            parts.append(f"正式:{formal}")
-        logging.info(" | ".join(parts))
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug(f"WS转发成功 | 密钥:{PrivacyUtils.sanitize_secret(secret)} | {ok}/{len(items)}")
     elif fail:
-        logging.warning(f"WS转发失败 | 密钥:{sanitized} | 失败:{fail}/{len(items)}")
+        logging.warning(f"WS转发失败 | 密钥:{PrivacyUtils.sanitize_secret(secret)} | 失败:{fail}/{len(items)}")
 
     return ok > 0
 
 
-def _sandbox_filter(data: bytes, info: dict) -> bool:
-    try:
-        d = json.loads(data).get("d", {})
-        if info["group"] and d.get("group_openid") != info["group"]:
-            return False
-        if info["member"] and d.get("author", {}).get("member_openid") != info["member"]:
-            return False
-        if info["content"] and info["content"] not in d.get("content", ""):
-            return False
-    except:
-        pass
-    return True
-
-
 async def _send_to_one(ws: WebSocket, data: bytes, conn_info: dict, secret: str):
-    is_sandbox = conn_info["is_sandbox"]
-    if is_sandbox and not _sandbox_filter(data, conn_info):
-        return None
-
     try:
         await ws.send_bytes(data)
-        sent_ok = True
+        conn_info["failure_count"] = 0
+        conn_info["last_activity"] = time.time()
+        return True
     except Exception:
-        sent_ok = False
+        pass
 
     lock = await cache_manager.get_lock_for_secret(secret)
     async with lock:
         conns = active_connections.get(secret)
         if not conns or ws not in conns:
-            return (sent_ok, is_sandbox)
-        if sent_ok:
-            conns[ws]["failure_count"] = 0
-            conns[ws]["last_activity"] = time.time()
-        else:
-            conns[ws]["failure_count"] += 1
-            if conns[ws]["failure_count"] >= 5:
-                try:
-                    await ws.close()
-                except:
-                    pass
-                del conns[ws]
-                if not conns:
-                    del active_connections[secret]
-                logging.warning(f"连接重试过多关闭 | 密钥:{PrivacyUtils.sanitize_secret(secret)}")
-    return (sent_ok, is_sandbox)
+            return False
+        conns[ws]["failure_count"] += 1
+        if conns[ws]["failure_count"] >= 5:
+            try:
+                await ws.close()
+            except:
+                pass
+            del conns[ws]
+            if not conns:
+                del active_connections[secret]
+            logging.warning(f"连接重试过多关闭 | 密钥:{PrivacyUtils.sanitize_secret(secret)}")
+    return False
 
 
 # ==================== 缓存补发 ====================
 
-async def resend_token_cache(secret: str, token: str, websocket: WebSocket):
+async def resend_cache(secret: str, websocket: WebSocket):
     try:
         await asyncio.sleep(3)
-        msgs = await cache_manager.get_messages_for_token(secret, token)
-        await _resend_cache(secret, websocket, msgs,
-                            f"Token:{PrivacyUtils.sanitize_secret(token)}")
+        msgs = await cache_manager.get_messages(secret)
+        await _resend_cache(secret, websocket, msgs, "缓存")
     except Exception as e:
-        logging.error(f"Token缓存补发异常: {e}")
-
-
-async def resend_public_cache(secret: str, websocket: WebSocket):
-    try:
-        await asyncio.sleep(3)
-        msgs = await cache_manager.get_public_messages(secret)
-        await _resend_cache(secret, websocket, msgs, "公共缓存")
-    except Exception as e:
-        logging.error(f"公共缓存补发异常: {e}")
+        logging.error(f"缓存补发异常: {e}")
 
 
 async def _resend_cache(secret: str, ws: WebSocket, queue: list, desc: str):
@@ -224,37 +179,75 @@ async def handle_ws_message(message: str, websocket: WebSocket):
             await websocket.send_bytes(_RESUMED)
     except Exception as e:
         logging.error(f"WS消息处理错误: {e}")
-        service_health["error_count"] += 1
 
 
 # ==================== Webhook 转发 ====================
 
+_retry_queue: deque = deque()
+
+
+async def _post_once(session: aiohttp.ClientSession, target: dict,
+                     body: bytes, headers: dict) -> dict:
+    """单次转发尝试, 返回下游响应内容"""
+    start = time.time()
+    try:
+        async with session.post(target['url'], data=body, headers=headers,
+                                timeout=aiohttp.ClientTimeout(total=PUSH_TIMEOUT)) as resp:
+            resp_body = await resp.read()
+            result = {'url': target['url'], 'status': resp.status,
+                      'success': 200 <= resp.status < 300,
+                      'body': resp_body,
+                      'content_type': resp.headers.get('Content-Type', 'application/json'),
+                      'duration': round(time.time() - start, 2)}
+            if not result['success']:
+                result['error'] = f"HTTP {resp.status}"
+            return result
+    except asyncio.TimeoutError:
+        return {'url': target['url'], 'success': False, 'error': '超时'}
+    except Exception as e:
+        return {'url': target['url'], 'success': False, 'error': str(e)}
+
+
 async def forward_webhook(targets: List[dict], body: bytes, headers: dict,
                           timeout: int, current_appid: str) -> list:
+    """同步转发一次 (最多 PUSH_TIMEOUT 秒); 失败的目标进入后台重发队列"""
     matched = [t for t in targets if t.get('appid') == current_appid]
     if not matched:
         return []
 
-    async def _send_one(session: aiohttp.ClientSession, target: dict) -> dict:
-        start = time.time()
-        retries = 0
-        last_err = None
-        while time.time() - start < MAX_RETRY_TIME:
-            try:
-                async with session.post(target['url'], data=body, headers=headers,
-                                        timeout=aiohttp.ClientTimeout(total=PUSH_TIMEOUT)) as resp:
-                    if 200 <= resp.status < 300:
-                        return {'url': target['url'], 'status': resp.status, 'success': True,
-                                'retry_count': retries, 'duration': round(time.time() - start, 2)}
-                    last_err = f"HTTP {resp.status}"
-            except asyncio.TimeoutError:
-                last_err = "超时"
-            except Exception as e:
-                last_err = str(e)
-            retries += 1
-            await asyncio.sleep(RETRY_INTERVAL)
-        return {'url': target['url'], 'success': False, 'retry_count': retries,
-                'error': last_err or '超时'}
-
     session = await get_http_session()
-    return await asyncio.gather(*[_send_one(session, t) for t in matched])
+    results = await asyncio.gather(
+        *[_post_once(session, t, body, headers) for t in matched])
+
+    for target, r in zip(matched, results):
+        if not r['success']:
+            _retry_queue.append({'target': target, 'body': body, 'headers': headers,
+                                 'deadline': time.time() + MAX_RETRY_TIME, 'retries': 0})
+            r['queued'] = True
+    return list(results)
+
+
+async def retry_queue_worker():
+    """失败重发队列 — 每秒轮询一轮, 逐条重试直至成功或超过 MAX_RETRY_TIME(5分钟)"""
+    while True:
+        try:
+            await asyncio.sleep(RETRY_INTERVAL)
+            if not _retry_queue:
+                continue
+            session = await get_http_session()
+            for _ in range(len(_retry_queue)):
+                item = _retry_queue.popleft()
+                item['retries'] += 1
+                r = await _post_once(session, item['target'], item['body'], item['headers'])
+                url = PrivacyUtils.sanitize_url(item['target']['url'])
+                if r['success']:
+                    logging.info(f"重发成功 | {url} | 重试:{item['retries']}次")
+                elif time.time() < item['deadline']:
+                    _retry_queue.append(item)
+                else:
+                    logging.error(f"重发放弃(超过{MAX_RETRY_TIME}s) | {url} | "
+                                  f"重试:{item['retries']}次 | 错误:{r.get('error', '未知')}")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logging.error(f"重发队列异常: {e}")

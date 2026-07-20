@@ -8,8 +8,6 @@ admin:
 # 消息缓存配置
 cache:
   default_max_messages: 1000
-  max_public_messages: 1000
-  max_token_messages: 500
   message_ttl: 300
   clean_interval: 120
 
@@ -37,6 +35,10 @@ raw_content:
 ssl:
   ssl_keyfile: ""
   ssl_certfile: ""
+
+# 是否信任反向代理头 (X-Forwarded-For / X-Real-IP)
+# 仅当服务部署在可信反代之后才设为 true，否则可被伪造绕过IP封禁
+trust_proxy: false
 
 # 统计信息配置
 stats:

@@ -1,53 +1,38 @@
 # -*- coding: utf-8 -*-
 """WebSocket 端点"""
 import asyncio
-import json
 import logging
 import time
-from collections import deque
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from modules.core.config import config
 from modules.data.cache import cache_manager
 from modules.net.connections import (HELLO_PAYLOAD, active_connections, handle_ws_message,
-                                     resend_public_cache, resend_token_cache,
-                                     send_heartbeat, service_health)
+                                     resend_cache, send_heartbeat)
 from modules.util.privacy import PrivacyUtils
 from modules.data.appid import app_id_manager
 
 router = APIRouter(tags=["websocket"])
 
 
-async def _handle_websocket(websocket: WebSocket, secret: str, token: str = None,
-                            group: str = None, member: str = None, content: str = None):
+async def _handle_websocket(websocket: WebSocket, secret: str):
     try:
         await websocket.accept()
         await websocket.send_bytes(HELLO_PAYLOAD)
 
-        is_sandbox = any([group, member, content])
         lock = await cache_manager.get_lock_for_secret(secret)
 
         async with lock:
             active_connections.setdefault(secret, {})[websocket] = {
-                "token": token, "failure_count": 0, "group": group,
-                "member": member, "content": content,
-                "is_sandbox": is_sandbox, "last_activity": time.time(),
+                "failure_count": 0,
+                "last_activity": time.time(),
             }
             count = len(active_connections[secret])
-            if token and secret not in config.no_cache_secrets:
-                cache_manager.message_cache.setdefault(
-                    secret, {"public": deque(maxlen=config.cache["max_public_messages"]), "tokens": {}})
-                cache_manager.message_cache[secret]["tokens"].setdefault(
-                    token, deque(maxlen=config.cache["max_token_messages"]))
 
         logging.info(f"WS连接 | 密钥:{PrivacyUtils.sanitize_secret(secret)} | "
-                     f"Token:{PrivacyUtils.sanitize_secret(token) if token else '无'} | "
-                     f"{'沙盒' if is_sandbox else '正式'} | 连接数:{count}")
+                     f"连接数:{count}")
 
-        if token:
-            asyncio.create_task(resend_token_cache(secret, token, websocket))
-        asyncio.create_task(resend_public_cache(secret, websocket))
+        asyncio.create_task(resend_cache(secret, websocket))
         heartbeat_task = asyncio.create_task(send_heartbeat(websocket, secret))
 
         try:
@@ -58,7 +43,6 @@ async def _handle_websocket(websocket: WebSocket, secret: str, token: str = None
                         if secret in active_connections and websocket in active_connections[secret]:
                             active_connections[secret][websocket]["last_activity"] = time.time()
                     await handle_ws_message(data, websocket)
-                    service_health["last_successful_ws_message"] = time.time()
                 except asyncio.TimeoutError:
                     async with lock:
                         if secret in active_connections and websocket in active_connections[secret]:
@@ -78,14 +62,8 @@ async def _handle_websocket(websocket: WebSocket, secret: str, token: str = None
                 pass
             async with lock:
                 if secret in active_connections and websocket in active_connections[secret]:
-                    conn_token = active_connections[secret][websocket]["token"]
                     del active_connections[secret][websocket]
                     remaining = len(active_connections[secret])
-                    if conn_token and secret not in config.no_cache_secrets:
-                        cache_manager.message_cache.setdefault(
-                            secret, {"public": deque(maxlen=config.cache["max_public_messages"]), "tokens": {}})
-                        cache_manager.message_cache[secret]["tokens"].setdefault(
-                            conn_token, deque(maxlen=config.cache["max_token_messages"]))
                     logging.info(f"WS断开 | 密钥:{PrivacyUtils.sanitize_secret(secret)} | 剩余:{remaining}")
                     if not active_connections[secret]:
                         del active_connections[secret]
@@ -98,14 +76,12 @@ async def _handle_websocket(websocket: WebSocket, secret: str, token: str = None
 
 
 @router.websocket("/ws/{secret}")
-async def websocket_endpoint(websocket: WebSocket, secret: str, token: str = None,
-                             group: str = None, member: str = None, content: str = None):
-    await _handle_websocket(websocket, secret, token, group, member, content)
+async def websocket_endpoint(websocket: WebSocket, secret: str):
+    await _handle_websocket(websocket, secret)
 
 
 @router.websocket("/api/ws/{appid}")
-async def appid_websocket_endpoint(websocket: WebSocket, appid: str, token: str = None,
-                                   group: str = None, member: str = None, content: str = None,
+async def appid_websocket_endpoint(websocket: WebSocket, appid: str,
                                    signature: str = None, timestamp: str = None, nonce: str = None):
     secret = app_id_manager.get_secret_by_appid(appid)
     if not secret:
@@ -117,4 +93,4 @@ async def appid_websocket_endpoint(websocket: WebSocket, appid: str, token: str 
         await websocket.accept()
         await websocket.close(code=1008, reason="签名验证失败")
         return
-    await _handle_websocket(websocket, secret, token, group, member, content)
+    await _handle_websocket(websocket, secret)

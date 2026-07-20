@@ -68,16 +68,8 @@ class MessageCacheManager:
                 del ic[k]
 
         dead_secrets = []
-        for secret, cache in self.message_cache.items():
-            pub = cache.get("public")
-            if pub:
-                self._purge_deque(pub, now)
-            tokens = cache.get("tokens")
-            if tokens:
-                dead_tokens = [t for t, q in tokens.items() if not self._purge_deque(q, now)]
-                for t in dead_tokens:
-                    del tokens[t]
-            if (not pub or len(pub) == 0) and not tokens:
+        for secret, q in self.message_cache.items():
+            if not self._purge_deque(q, now):
                 dead_secrets.append(secret)
         for s in dead_secrets:
             del self.message_cache[s]
@@ -91,48 +83,28 @@ class MessageCacheManager:
 
     # ---------- 消息缓存读写 ----------
 
-    def _ensure_cache(self, secret: str) -> dict:
-        c = self.message_cache.get(secret)
-        if c is None:
-            c = {"public": deque(maxlen=config.cache["max_public_messages"]), "tokens": {}}
-            self.message_cache[secret] = c
-        return c
+    def _ensure_cache(self, secret: str) -> deque:
+        q = self.message_cache.get(secret)
+        if q is None:
+            q = deque(maxlen=config.cache["default_max_messages"])
+            self.message_cache[secret] = q
+        return q
 
-    async def add_message(self, secret: str, data: bytes, token: str = None) -> bool:
+    async def add_message(self, secret: str, data: bytes) -> bool:
         lock = await self.get_lock_for_secret(secret)
         async with lock:
             expiry = time.time() + config.cache["message_ttl"]
-            c = self._ensure_cache(secret)
-            if token is None:
-                c["public"].append((expiry, data))
-            else:
-                tq = c["tokens"]
-                if token not in tq:
-                    tq[token] = deque(maxlen=config.cache["max_token_messages"])
-                tq[token].append((expiry, data))
+            self._ensure_cache(secret).append((expiry, data))
             return True
 
-    async def get_messages_for_token(self, secret: str, token: str) -> list:
+    async def get_messages(self, secret: str) -> list:
         lock = await self.get_lock_for_secret(secret)
         async with lock:
-            c = self.message_cache.get(secret)
-            if not c:
-                return []
-            q = c.get("tokens", {}).get(token)
+            q = self.message_cache.get(secret)
             if not q:
                 return []
             msgs = list(q)
             q.clear()
-            return msgs
-
-    async def get_public_messages(self, secret: str) -> list:
-        lock = await self.get_lock_for_secret(secret)
-        async with lock:
-            c = self.message_cache.get(secret)
-            if not c or not c.get("public"):
-                return []
-            msgs = list(c["public"])
-            c["public"].clear()
             return msgs
 
     # ---------- 消息去重 ----------

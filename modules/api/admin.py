@@ -3,6 +3,7 @@
 import logging
 import sqlite3
 import time
+from contextlib import closing
 from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -142,6 +143,9 @@ async def update_settings(data: Dict[str, Any],
         path = rc.get("path", "")
         if not path or ".." in path or path.startswith("/") or ":" in path:
             raise HTTPException(status_code=400, detail="raw_content.path路径格式不安全")
+    if "log_level" in settings and settings["log_level"] not in (
+            "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+        raise HTTPException(status_code=400, detail="无效的日志级别")
     config.update_settings(settings)
     if "log_level" in settings:
         logging.getLogger().setLevel(settings["log_level"])
@@ -198,16 +202,15 @@ async def remove_webhook(target: Dict[str, str],
 
 @router.get("/db/tables")
 async def db_list_tables(admin: str = Depends(get_current_admin)):
-    conn = sqlite3.connect(db.DB_PATH)
-    conn.row_factory = sqlite3.Row
-    tables = [r[0] for r in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()]
-    result = []
-    for t in tables:
-        count = conn.execute(f"SELECT COUNT(*) FROM [{t}]").fetchone()[0]
-        cols = [c[1] for c in conn.execute(f"PRAGMA table_info([{t}])").fetchall()]
-        result.append({"name": t, "count": count, "columns": cols})
-    conn.close()
+    with closing(sqlite3.connect(db.DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        tables = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()]
+        result = []
+        for t in tables:
+            count = conn.execute(f"SELECT COUNT(*) FROM [{t}]").fetchone()[0]
+            cols = [c[1] for c in conn.execute(f"PRAGMA table_info([{t}])").fetchall()]
+            result.append({"name": t, "count": count, "columns": cols})
     return result
 
 
@@ -215,19 +218,17 @@ async def db_list_tables(admin: str = Depends(get_current_admin)):
 async def db_query_table(table_name: str, page: int = Query(1, ge=1),
                          page_size: int = Query(50, ge=1, le=500),
                          admin: str = Depends(get_current_admin)):
-    conn = sqlite3.connect(db.DB_PATH)
-    conn.row_factory = sqlite3.Row
-    valid = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table_name,)).fetchone()
-    if not valid:
-        conn.close()
-        raise HTTPException(status_code=404, detail="表不存在")
-    total = conn.execute(f"SELECT COUNT(*) FROM [{table_name}]").fetchone()[0]
-    cols = [c[1] for c in conn.execute(f"PRAGMA table_info([{table_name}])").fetchall()]
-    offset = (page - 1) * page_size
-    rows = conn.execute(f"SELECT * FROM [{table_name}] LIMIT ? OFFSET ?",
-                        (page_size, offset)).fetchall()
-    conn.close()
+    with closing(sqlite3.connect(db.DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        valid = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table_name,)).fetchone()
+        if not valid:
+            raise HTTPException(status_code=404, detail="表不存在")
+        total = conn.execute(f"SELECT COUNT(*) FROM [{table_name}]").fetchone()[0]
+        cols = [c[1] for c in conn.execute(f"PRAGMA table_info([{table_name}])").fetchall()]
+        offset = (page - 1) * page_size
+        rows = conn.execute(f"SELECT * FROM [{table_name}] LIMIT ? OFFSET ?",
+                            (page_size, offset)).fetchall()
     data = [dict(r) for r in rows]
     return {"table": table_name, "columns": cols, "rows": data,
             "total": total, "page": page, "page_size": page_size}

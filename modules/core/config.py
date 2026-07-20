@@ -8,14 +8,14 @@ import yaml
 _DEFAULTS = {
     "admin": {"password": "", "enabled": True},
     "cache": {
-        "default_max_messages": 1000, "max_public_messages": 1000,
-        "max_token_messages": 500, "message_ttl": 300, "clean_interval": 120,
+        "default_max_messages": 1000, "message_ttl": 300, "clean_interval": 120,
     },
     "deduplication_ttl": 20, "log_level": "INFO", "log_maxlen": 2000,
     "no_cache_secrets": [], "port": 8000,
     "raw_content": {"enabled": False, "path": "logs"},
     "ssl": {"ssl_keyfile": "", "ssl_certfile": ""},
     "stats": {"write_interval": 5},
+    "trust_proxy": False,
     "webhook_forward": {"enabled": False, "timeout": 5, "targets": []},
 }
 
@@ -36,8 +36,6 @@ class ConfigManager:
     def __init__(self, path: str):
         self._file = path
         self._lock = threading.Lock()
-        self._mtime: float = 0
-        self._stop = threading.Event()
         self._snap: dict = dict(_DEFAULTS)
 
     # ---------- 加载 / 保存 ----------
@@ -49,7 +47,6 @@ class ConfigManager:
             merged = _deep_merge(_DEFAULTS, raw)
             with self._lock:
                 self._snap = merged
-                self._mtime = os.path.getmtime(self._file)
             logging.info(f"配置已加载: {self._file}")
         except FileNotFoundError:
             logging.warning(f"配置文件不存在，使用默认值: {self._file}")
@@ -63,7 +60,6 @@ class ConfigManager:
             with open(self._file, "w", encoding="utf-8") as f:
                 yaml.dump(snap, f, default_flow_style=False,
                           allow_unicode=True, sort_keys=False)
-            self._mtime = os.path.getmtime(self._file)
             logging.info("配置已保存")
         except Exception as e:
             logging.error(f"保存配置失败: {e}")
@@ -79,27 +75,6 @@ class ConfigManager:
         except Exception as e:
             logging.error(f"更新配置失败: {e}")
             return False
-
-    # ---------- 热加载 ----------
-
-    def start_watcher(self):
-        if not self._stop.is_set():
-            self._stop.clear()
-        t = threading.Thread(target=self._watch, daemon=True, name="cfg-watch")
-        t.start()
-        logging.info("配置热加载监控已启动")
-
-    def _watch(self):
-        while not self._stop.wait(2):
-            try:
-                mt = os.path.getmtime(self._file)
-                if mt != self._mtime:
-                    logging.info("检测到 config.yaml 变更，热加载中...")
-                    self.load()
-            except FileNotFoundError:
-                pass
-            except Exception as e:
-                logging.error(f"配置监控异常: {e}")
 
     # ---------- 属性访问 (无锁快速路径) ----------
 
