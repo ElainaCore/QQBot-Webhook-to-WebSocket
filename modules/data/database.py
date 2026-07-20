@@ -6,6 +6,7 @@ import logging
 import os
 import sqlite3
 import threading
+from contextlib import closing
 import time
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -23,8 +24,7 @@ _stop_flag = threading.Event()
 
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    with _db_lock:
-        conn = sqlite3.connect(DB_PATH)
+    with _db_lock, closing(sqlite3.connect(DB_PATH)) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=5000")
@@ -64,7 +64,6 @@ def init_db():
         for key in ('total_messages', 'ws_success', 'ws_failure', 'wh_success', 'wh_failure'):
             conn.execute("INSERT OR IGNORE INTO stats_global(key, value) VALUES(?, 0)", (key,))
         conn.commit()
-        conn.close()
     logging.info("SQLite 数据库已初始化")
 
 
@@ -76,11 +75,9 @@ def _try_migrate(path: str, label: str, importer):
     try:
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        with _db_lock:
-            conn = _get_conn()
+        with _db_lock, closing(_get_conn()) as conn:
             importer(conn, data)
             conn.commit()
-            conn.close()
         os.rename(path, path + '.migrated')
         return True
     except Exception as e:
@@ -159,11 +156,10 @@ def _flush_buffer():
         _write_buffer.clear()
     with _db_lock:
         try:
-            conn = _get_conn()
-            for sql, params in batch:
-                conn.execute(sql, params)
-            conn.commit()
-            conn.close()
+            with closing(_get_conn()) as conn:
+                for sql, params in batch:
+                    conn.execute(sql, params)
+                conn.commit()
         except Exception as e:
             logging.error(f"批量写入失败 ({len(batch)} 条): {e}")
 
@@ -194,39 +190,32 @@ def _flush_loop():
 # ==================== AppID CRUD ====================
 
 def get_all_appids() -> List[Dict]:
-    with _db_lock:
-        conn = _get_conn()
+    with _db_lock, closing(_get_conn()) as conn:
         rows = conn.execute("SELECT * FROM appids ORDER BY create_time DESC").fetchall()
-        conn.close()
     return [dict(r) for r in rows]
 
 
 def get_secret_by_appid(appid: str) -> Optional[str]:
-    with _db_lock:
-        conn = _get_conn()
+    with _db_lock, closing(_get_conn()) as conn:
         row = conn.execute("SELECT secret FROM appids WHERE appid=?", (appid,)).fetchone()
-        conn.close()
     return row['secret'] if row else None
 
 
 def create_appid(appid: str, secret: str, description: str = '') -> Tuple[bool, str]:
-    with _db_lock:
-        conn = _get_conn()
+    with _db_lock, closing(_get_conn()) as conn:
         existing = conn.execute("SELECT 1 FROM appids WHERE appid=?", (appid,)).fetchone()
         conn.execute("INSERT OR REPLACE INTO appids VALUES(?,?,?,?)",
                      (appid, secret, description, time.time()))
         conn.commit()
-        conn.close()
     return (True, 'updated' if existing else 'success')
 
 
 def delete_appid(appid: str) -> bool:
-    with _db_lock:
-        conn = _get_conn()
+    with _db_lock, closing(_get_conn()) as conn:
         cur = conn.execute("DELETE FROM appids WHERE appid=?", (appid,))
+        deleted = cur.rowcount
         conn.commit()
-        conn.close()
-    return cur.rowcount > 0
+    return deleted > 0
 
 
 def verify_appid_signature(appid: str, signature: str, timestamp: str, nonce: str) -> bool:
@@ -239,11 +228,9 @@ def verify_appid_signature(appid: str, signature: str, timestamp: str, nonce: st
 # ==================== 统计 ====================
 
 def load_stats() -> Dict:
-    with _db_lock:
-        conn = _get_conn()
+    with _db_lock, closing(_get_conn()) as conn:
         g_rows = conn.execute("SELECT key, value FROM stats_global").fetchall()
         p_rows = conn.execute("SELECT * FROM stats_per_secret").fetchall()
-        conn.close()
     g = {r['key']: r['value'] for r in g_rows}
     ps = {r['secret']: {
         'ws': {'success': r['ws_success'], 'failure': r['ws_failure']},
@@ -275,10 +262,8 @@ def save_stats_snapshot(stats: Dict):
 
 def load_sessions() -> Dict:
     now = datetime.now()
-    with _db_lock:
-        conn = _get_conn()
+    with _db_lock, closing(_get_conn()) as conn:
         rows = conn.execute("SELECT * FROM sessions").fetchall()
-        conn.close()
     result = {}
     for r in rows:
         try:
@@ -312,10 +297,8 @@ def cleanup_expired_sessions():
 # ==================== IP CRUD ====================
 
 def load_ip_data() -> Dict:
-    with _db_lock:
-        conn = _get_conn()
+    with _db_lock, closing(_get_conn()) as conn:
         rows = conn.execute("SELECT * FROM ip_access").fetchall()
-        conn.close()
     return {r['ip']: {
         'last_access': r['last_access'],
         'password_fail_times': json.loads(r['password_fail_times'] or '[]'),

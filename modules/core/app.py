@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from modules.core.config import config
 from modules.data import database as db
 from modules.data.cache import cache_manager
-from modules.net.connections import active_connections
+from modules.net.connections import active_connections, close_http_session
 from modules.core.session import valid_sessions, load_from_db as load_session_data
 from modules.net.monitoring import monitor_service_health
 from modules.data.stats import stats_manager
@@ -102,6 +102,7 @@ async def lifespan(application: FastAPI):
         t.cancel()
     cache_manager.stop_cleaning_thread()
     db.stop_flush_thread()
+    await close_http_session()
     try:
         await asyncio.gather(*tasks, return_exceptions=True)
     except:

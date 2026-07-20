@@ -27,6 +27,28 @@ service_health = {
 PUSH_TIMEOUT = 10
 RETRY_INTERVAL = 1
 MAX_RETRY_TIME = 180
+MAX_CONNECTIONS = 500
+
+_http_session: aiohttp.ClientSession = None
+_session_lock = asyncio.Lock()
+
+
+async def get_http_session() -> aiohttp.ClientSession:
+    """全局共享 ClientSession — 限制并发连接数，避免每次转发新建会话耗尽文件描述符"""
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        async with _session_lock:
+            if _http_session is None or _http_session.closed:
+                _http_session = aiohttp.ClientSession(
+                    connector=aiohttp.TCPConnector(limit=MAX_CONNECTIONS, ttl_dns_cache=300))
+    return _http_session
+
+
+async def close_http_session():
+    global _http_session
+    if _http_session and not _http_session.closed:
+        await _http_session.close()
+    _http_session = None
 
 # 预编码静态 JSON 负载 — 避免每次 json.dumps
 HELLO_PAYLOAD = json.dumps({"op": 10, "d": {"heartbeat_interval": 30000}}).encode()
@@ -234,5 +256,5 @@ async def forward_webhook(targets: List[dict], body: bytes, headers: dict,
         return {'url': target['url'], 'success': False, 'retry_count': retries,
                 'error': last_err or '超时'}
 
-    async with aiohttp.ClientSession() as session:
-        return await asyncio.gather(*[_send_one(session, t) for t in matched])
+    session = await get_http_session()
+    return await asyncio.gather(*[_send_one(session, t) for t in matched])

@@ -72,6 +72,10 @@ async def _handle_websocket(websocket: WebSocket, secret: str, token: str = None
             logging.error(f"WS异常: {e}")
         finally:
             heartbeat_task.cancel()
+            try:
+                await websocket.close()
+            except Exception:
+                pass
             async with lock:
                 if secret in active_connections and websocket in active_connections[secret]:
                     conn_token = active_connections[secret][websocket]["token"]
