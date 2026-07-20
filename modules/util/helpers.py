@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """日志配置 + Ed25519 签名工具"""
 import logging
+from aiohttp.http_exceptions import BadHttpMessage
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from modules.core.config import config
 
@@ -34,6 +35,15 @@ def setup_logger():
                         datefmt='%Y-%m-%d %H:%M:%S', handlers=[logging.StreamHandler()])
     logging.getLogger('urllib3').setLevel(logging.WARNING)
     logging.getLogger('aiohttp.access').setLevel(logging.WARNING)
+
+    class _BadRequestFilter(logging.Filter):
+        """屏蔽畸形请求噪音 (如对 HTTP 端口发 TLS 握手、端口扫描)"""
+        def filter(self, rec):
+            if rec.exc_info and isinstance(rec.exc_info[1], BadHttpMessage):
+                return False
+            return True
+
+    logging.getLogger('aiohttp.server').addFilter(_BadRequestFilter())
     root = logging.getLogger()
     root.setLevel(level)
     f = _F()
