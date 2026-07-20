@@ -6,8 +6,7 @@ import os
 import time
 from datetime import datetime
 
-from fastapi import APIRouter, Header, HTTPException, Query, Request
-from fastapi.responses import Response
+from aiohttp import web
 
 from modules.core.config import config
 from modules.data.cache import cache_manager
@@ -18,16 +17,21 @@ from modules.data.stats import stats_manager
 from modules.data.appid import app_id_manager
 from modules.util.helpers import generate_signature
 
-router = APIRouter(tags=["webhook"])
+_SUCCESS_BODY = b'{"status": "success"}'
 
 
-@router.post("/webhook")
-async def handle_webhook(request: Request,
-                         user_agent: str = Header(None),
-                         x_bot_appid: str = Header(None)):
+def _success() -> web.Response:
+    # 预编码成功响应体 — 避免每次 json 序列化
+    return web.Response(body=_SUCCESS_BODY, content_type='application/json')
+
+
+async def handle_webhook(request: web.Request, secret: str = None) -> web.Response:
     start_time = time.time()
-    secret = request.query_params.get('secret')
-    body = await request.body()
+    if secret is None:
+        secret = request.query.get('secret')
+    user_agent = request.headers.get('User-Agent')
+    x_bot_appid = request.headers.get('X-Bot-Appid')
+    body = await request.read()
 
     if getattr(config, 'raw_content', {}).get('enabled'):
         _log_raw_message(request, body, secret, user_agent, x_bot_appid)
@@ -41,7 +45,7 @@ async def handle_webhook(request: Request,
         msg_id = msg_data.get('id')
         if msg_id:
             if cache_manager.has_message_id(msg_id):
-                return {"status": "success"}
+                return _success()
             cache_manager.add_message_id(msg_id, config.deduplication_ttl)
     except:
         pass
@@ -51,23 +55,24 @@ async def handle_webhook(request: Request,
     if isinstance(d, dict) and "event_ts" in d and "plain_token" in d:
         try:
             result = generate_signature(secret, d["event_ts"], d["plain_token"])
-            return result
+            return web.json_response(result)
         except Exception as e:
             logging.error(f"签名错误: {e}")
-            return {"status": "error"}
+            return web.json_response({"status": "error"})
 
     # Webhook 二次转发 (按AppID匹配) — 同步等待一次尝试, 失败进后台重发队列
     downstream_resp = None
     headers = dict(request.headers)
-    if config.webhook_forward['enabled'] and config.webhook_forward['targets']:
-        appid_for_forward = x_bot_appid or request.query_params.get('appid', '')
+    wf = config.webhook_forward
+    if wf['enabled'] and wf['targets']:
+        appid_for_forward = x_bot_appid or request.query.get('appid', '')
         if appid_for_forward:
             downstream_resp = await _forward_to_webhooks(appid_for_forward, body, headers)
 
     # WebSocket 转发
     enhanced_body = _add_http_context(body, request, msg_data, headers)
     skip_cache = secret in config.no_cache_secrets
-    has_online = secret in active_connections and active_connections[secret]
+    has_online = bool(active_connections.get(secret))
 
     if not has_online and not skip_cache:
         await cache_manager.add_message(secret, enhanced_body)
@@ -84,28 +89,24 @@ async def handle_webhook(request: Request,
                         f"密钥:{PrivacyUtils.sanitize_secret(secret)}")
 
     if downstream_resp is not None:
-        return Response(content=downstream_resp['body'],
-                        status_code=downstream_resp['status'],
-                        media_type=downstream_resp['content_type'])
-    return {"status": "success"}
+        return web.Response(body=downstream_resp['body'],
+                            status=downstream_resp['status'],
+                            headers={'Content-Type': downstream_resp['content_type']})
+    return _success()
 
 
-@router.post("/api/{appid}")
-async def handle_appid_webhook(appid: str, request: Request,
-                               user_agent: str = Header(None),
-                               x_bot_appid: str = Header(None),
-                               signature: str = Query(None),
-                               timestamp: str = Query(None),
-                               nonce: str = Query(None)):
+async def handle_appid_webhook(request: web.Request) -> web.Response:
+    appid = request.match_info["appid"]
+    signature = request.query.get("signature")
+    timestamp = request.query.get("timestamp")
+    nonce = request.query.get("nonce")
     secret = app_id_manager.get_secret_by_appid(appid)
     if not secret:
-        raise HTTPException(status_code=404, detail="无效的AppID")
+        return web.json_response({"detail": "无效的AppID"}, status=404)
     if (signature and timestamp and nonce
             and not app_id_manager.verify_signature(appid, signature, timestamp, nonce)):
-        raise HTTPException(status_code=403, detail="签名验证失败")
-    request.query_params._dict["secret"] = secret
-    return await handle_webhook(request=request,
-                                user_agent=user_agent, x_bot_appid=x_bot_appid)
+        return web.json_response({"detail": "签名验证失败"}, status=403)
+    return await handle_webhook(request, secret=secret)
 
 
 # ========== 内部辅助 ==========
@@ -121,7 +122,7 @@ def _log_raw_message(request, body, secret, user_agent, x_bot_appid):
             raw_body = body.decode('utf-8', errors='ignore')
         entry = {
             'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'client_ip': request.client.host if request.client else "unknown",
+            'client_ip': request.remote or "unknown",
             'secret': secret, 'user_agent': user_agent, 'x_bot_appid': x_bot_appid,
             'content_length': len(body), 'raw_body': raw_body,
         }
@@ -178,9 +179,9 @@ def _add_http_context(body, request, data=None, headers=None):
             data = dict(data)
             data['http_context'] = {
                 'headers': headers if headers is not None else dict(request.headers),
-                'path': request.url.path,
+                'path': request.path,
                 'method': request.method, 'url': str(request.url),
-                'remote_addr': request.client.host if request.client else 'unknown',
+                'remote_addr': request.remote or 'unknown',
             }
             return json.dumps(data, ensure_ascii=False).encode('utf-8')
     except:

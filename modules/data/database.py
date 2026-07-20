@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 """SQLite 数据库模块 — WAL 模式 + 2秒批量写入 + DRY 迁移"""
-import hashlib
 import json
 import logging
 import os
@@ -216,13 +215,6 @@ def delete_appid(appid: str) -> bool:
         deleted = cur.rowcount
         conn.commit()
     return deleted > 0
-
-
-def verify_appid_signature(appid: str, signature: str, timestamp: str, nonce: str) -> bool:
-    secret = get_secret_by_appid(appid)
-    if not secret:
-        return False
-    return signature == hashlib.sha1((secret + timestamp + nonce).encode()).hexdigest()
 
 
 # ==================== 统计 ====================

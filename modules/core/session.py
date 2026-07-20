@@ -9,7 +9,7 @@ import time
 from datetime import datetime, timedelta
 from typing import Dict, Optional
 
-from fastapi import HTTPException, Request, status
+from aiohttp import web
 
 from modules.core.config import config
 from modules.data import database as db
@@ -36,7 +36,7 @@ def load_from_db():
 
 # ========== IP 管理 ==========
 
-def get_real_ip(request: Request) -> str:
+def get_real_ip(request: web.Request) -> str:
     if config.trust_proxy:
         forwarded = request.headers.get('X-Forwarded-For')
         if forwarded:
@@ -44,7 +44,7 @@ def get_real_ip(request: Request) -> str:
         real_ip = request.headers.get('X-Real-IP')
         if real_ip:
             return real_ip.strip()
-    return request.client.host if request.client else 'unknown'
+    return request.remote or 'unknown'
 
 
 def record_ip_access(ip: str, success: bool = True):
@@ -142,7 +142,7 @@ def limit_session_count():
             db.delete_session(token)
 
 
-def is_logged_in(request: Request) -> bool:
+def is_logged_in(request: web.Request) -> bool:
     cleanup_sessions()
     cookie = request.cookies.get(COOKIE_NAME)
     if not cookie:
@@ -162,7 +162,7 @@ def is_logged_in(request: Request) -> bool:
     return True
 
 
-def create_session(request: Request) -> str:
+def create_session(request: web.Request) -> str:
     cleanup_sessions()
     limit_session_count()
     token = secrets.token_hex(32)
@@ -178,7 +178,7 @@ def create_session(request: Request) -> str:
     return token
 
 
-def remove_session(request: Request):
+def remove_session(request: web.Request):
     cookie = request.cookies.get(COOKIE_NAME)
     if cookie:
         token = verify_cookie(cookie)
@@ -187,8 +187,8 @@ def remove_session(request: Request):
             db.delete_session(token)
 
 
-async def get_current_admin(request: Request) -> str:
+def require_admin(request: web.Request) -> str:
     if not is_logged_in(request):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
-                            detail="未登录或会话已过期")
+        raise web.HTTPUnauthorized(
+            text='{"detail": "未登录或会话已过期"}', content_type='application/json')
     return "admin"

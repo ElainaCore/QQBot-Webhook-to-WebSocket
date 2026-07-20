@@ -8,7 +8,7 @@ from collections import deque
 from typing import Dict, List
 
 import aiohttp
-from fastapi import WebSocket
+from aiohttp import web
 
 from modules.util.privacy import PrivacyUtils
 from modules.data.cache import cache_manager
@@ -25,6 +25,7 @@ MAX_CONNECTIONS = 500
 
 _http_session: aiohttp.ClientSession = None
 _session_lock = asyncio.Lock()
+_PUSH_CLIENT_TIMEOUT = aiohttp.ClientTimeout(total=PUSH_TIMEOUT)
 
 
 async def get_http_session() -> aiohttp.ClientSession:
@@ -61,9 +62,18 @@ async def send_to_all(secret: str, data: bytes) -> bool:
         return False
     items = list(conns.items())
 
-    results = await asyncio.gather(
-        *[_send_to_one(ws, data, info, secret) for ws, info in items],
-        return_exceptions=True)
+    if len(items) == 1:
+        # 单连接快速路径 — 避免 gather 的任务调度开销
+        ws, info = items[0]
+        try:
+            r = await _send_to_one(ws, data, info, secret)
+        except Exception:
+            r = None
+        results = (r,)
+    else:
+        results = await asyncio.gather(
+            *[_send_to_one(ws, data, info, secret) for ws, info in items],
+            return_exceptions=True)
 
     ok = fail = 0
     for r in results:
@@ -86,7 +96,7 @@ async def send_to_all(secret: str, data: bytes) -> bool:
     return ok > 0
 
 
-async def _send_to_one(ws: WebSocket, data: bytes, conn_info: dict, secret: str):
+async def _send_to_one(ws: web.WebSocketResponse, data: bytes, conn_info: dict, secret: str):
     try:
         await ws.send_bytes(data)
         conn_info["failure_count"] = 0
@@ -95,7 +105,7 @@ async def _send_to_one(ws: WebSocket, data: bytes, conn_info: dict, secret: str)
     except Exception:
         pass
 
-    lock = await cache_manager.get_lock_for_secret(secret)
+    lock = cache_manager.get_lock_for_secret(secret)
     async with lock:
         conns = active_connections.get(secret)
         if not conns or ws not in conns:
@@ -115,7 +125,7 @@ async def _send_to_one(ws: WebSocket, data: bytes, conn_info: dict, secret: str)
 
 # ==================== 缓存补发 ====================
 
-async def resend_cache(secret: str, websocket: WebSocket):
+async def resend_cache(secret: str, websocket: web.WebSocketResponse):
     try:
         await asyncio.sleep(3)
         msgs = await cache_manager.get_messages(secret)
@@ -124,7 +134,7 @@ async def resend_cache(secret: str, websocket: WebSocket):
         logging.error(f"缓存补发异常: {e}")
 
 
-async def _resend_cache(secret: str, ws: WebSocket, queue: list, desc: str):
+async def _resend_cache(secret: str, ws: web.WebSocketResponse, queue: list, desc: str):
     if not queue:
         return
     now = time.time()
@@ -148,12 +158,12 @@ async def _resend_cache(secret: str, ws: WebSocket, queue: list, desc: str):
 
 # ==================== 心跳 / 消息处理 ====================
 
-async def send_heartbeat(websocket: WebSocket, secret: str):
+async def send_heartbeat(websocket: web.WebSocketResponse, secret: str):
     failures = 0
     try:
         while True:
             await asyncio.sleep(35)
-            if websocket.client_state.name != 'CONNECTED':
+            if websocket.closed:
                 break
             try:
                 await websocket.send_bytes(_HB_ACK)
@@ -168,8 +178,11 @@ async def send_heartbeat(websocket: WebSocket, secret: str):
         pass
 
 
-async def handle_ws_message(message: str, websocket: WebSocket):
+async def handle_ws_message(message: str, websocket: web.WebSocketResponse):
     try:
+        if message == '{"op":1,"d":1}':
+            await websocket.send_bytes(_HB_ACK)
+            return
         op = json.loads(message).get("op")
         if op == 1:
             await websocket.send_bytes(_HB_ACK)
@@ -192,7 +205,7 @@ async def _post_once(session: aiohttp.ClientSession, target: dict,
     start = time.time()
     try:
         async with session.post(target['url'], data=body, headers=headers,
-                                timeout=aiohttp.ClientTimeout(total=PUSH_TIMEOUT)) as resp:
+                                timeout=_PUSH_CLIENT_TIMEOUT) as resp:
             resp_body = await resp.read()
             result = {'url': target['url'], 'status': resp.status,
                       'success': 200 <= resp.status < 300,

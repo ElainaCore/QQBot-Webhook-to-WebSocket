@@ -4,7 +4,7 @@ import asyncio
 import logging
 import time
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from aiohttp import WSMsgType, web
 
 from modules.data.cache import cache_manager
 from modules.net.connections import (HELLO_PAYLOAD, active_connections, handle_ws_message,
@@ -12,21 +12,18 @@ from modules.net.connections import (HELLO_PAYLOAD, active_connections, handle_w
 from modules.util.privacy import PrivacyUtils
 from modules.data.appid import app_id_manager
 
-router = APIRouter(tags=["websocket"])
 
-
-async def _handle_websocket(websocket: WebSocket, secret: str):
+async def _handle_websocket(request: web.Request, secret: str) -> web.WebSocketResponse:
+    websocket = web.WebSocketResponse()
     try:
-        await websocket.accept()
+        await websocket.prepare(request)
         await websocket.send_bytes(HELLO_PAYLOAD)
 
-        lock = await cache_manager.get_lock_for_secret(secret)
+        lock = cache_manager.get_lock_for_secret(secret)
 
+        conn_info = {"failure_count": 0, "last_activity": time.time()}
         async with lock:
-            active_connections.setdefault(secret, {})[websocket] = {
-                "failure_count": 0,
-                "last_activity": time.time(),
-            }
+            active_connections.setdefault(secret, {})[websocket] = conn_info
             count = len(active_connections[secret])
 
         logging.info(f"WS连接 | 密钥:{PrivacyUtils.sanitize_secret(secret)} | "
@@ -38,20 +35,19 @@ async def _handle_websocket(websocket: WebSocket, secret: str):
         try:
             while True:
                 try:
-                    data = await asyncio.wait_for(websocket.receive_text(), timeout=60)
-                    async with lock:
-                        if secret in active_connections and websocket in active_connections[secret]:
-                            active_connections[secret][websocket]["last_activity"] = time.time()
-                    await handle_ws_message(data, websocket)
+                    msg = await websocket.receive(timeout=60)
+                    if msg.type in (WSMsgType.TEXT, WSMsgType.BINARY):
+                        conn_info["last_activity"] = time.time()
+                        data = msg.data.decode() if isinstance(msg.data, bytes) else msg.data
+                        await handle_ws_message(data, websocket)
+                    elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING,
+                                      WSMsgType.CLOSED, WSMsgType.ERROR):
+                        break
                 except asyncio.TimeoutError:
-                    async with lock:
-                        if secret in active_connections and websocket in active_connections[secret]:
-                            if time.time() - active_connections[secret][websocket]["last_activity"] > 90:
-                                break
-                        else:
-                            break
-        except WebSocketDisconnect:
-            pass
+                    if websocket not in active_connections.get(secret, {}):
+                        break
+                    if time.time() - conn_info["last_activity"] > 90:
+                        break
         except Exception as e:
             logging.error(f"WS异常: {e}")
         finally:
@@ -73,24 +69,28 @@ async def _handle_websocket(websocket: WebSocket, secret: str):
             await websocket.close()
         except:
             pass
+    return websocket
 
 
-@router.websocket("/ws/{secret}")
-async def websocket_endpoint(websocket: WebSocket, secret: str):
-    await _handle_websocket(websocket, secret)
+async def websocket_endpoint(request: web.Request) -> web.WebSocketResponse:
+    return await _handle_websocket(request, request.match_info["secret"])
 
 
-@router.websocket("/api/ws/{appid}")
-async def appid_websocket_endpoint(websocket: WebSocket, appid: str,
-                                   signature: str = None, timestamp: str = None, nonce: str = None):
+async def appid_websocket_endpoint(request: web.Request) -> web.WebSocketResponse:
+    appid = request.match_info["appid"]
+    signature = request.query.get("signature")
+    timestamp = request.query.get("timestamp")
+    nonce = request.query.get("nonce")
     secret = app_id_manager.get_secret_by_appid(appid)
     if not secret:
-        await websocket.accept()
-        await websocket.close(code=1008, reason="无效的AppID")
-        return
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.close(code=1008, message="无效的AppID".encode())
+        return ws
     if (signature and timestamp and nonce
             and not app_id_manager.verify_signature(appid, signature, timestamp, nonce)):
-        await websocket.accept()
-        await websocket.close(code=1008, reason="签名验证失败")
-        return
-    await _handle_websocket(websocket, secret)
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.close(code=1008, message="签名验证失败".encode())
+        return ws
+    return await _handle_websocket(request, secret)

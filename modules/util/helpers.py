@@ -33,7 +33,7 @@ def setup_logger():
     logging.basicConfig(level=level, format='%(asctime)s - %(levelname)s - %(message)s',
                         datefmt='%Y-%m-%d %H:%M:%S', handlers=[logging.StreamHandler()])
     logging.getLogger('urllib3').setLevel(logging.WARNING)
-    logging.getLogger('uvicorn.error').setLevel(logging.INFO)
+    logging.getLogger('aiohttp.access').setLevel(logging.WARNING)
     root = logging.getLogger()
     root.setLevel(level)
     f = _F()

@@ -1,16 +1,11 @@
 # -*- coding: utf-8 -*-
-"""FastAPI 应用工厂 — 实例创建、生命周期、SPA 路由"""
+"""aiohttp 应用工厂 — 实例创建、生命周期、SPA 路由"""
 import asyncio
 import logging
 import os
-import time
-from contextlib import asynccontextmanager
 from datetime import datetime
 
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
+from aiohttp import web
 
 from modules.core.config import config
 from modules.data import database as db
@@ -68,8 +63,7 @@ async def _cleanup_memory():
 
 # ========== 生命周期 ==========
 
-@asynccontextmanager
-async def lifespan(application: FastAPI):
+async def _on_startup(application: web.Application):
     db.init_db()
     db.migrate_from_json()
     db.start_flush_thread()
@@ -78,7 +72,7 @@ async def lifespan(application: FastAPI):
     app_id_manager.load_from_db()
     stats_manager.start_write_thread()
 
-    tasks = [
+    application['bg_tasks'] = [
         asyncio.create_task(_cleanup_memory()),
         asyncio.create_task(_stats_flush_loop()),
         asyncio.create_task(retry_queue_worker()),
@@ -96,9 +90,10 @@ async def lifespan(application: FastAPI):
     logger.info(f"面板地址: {protocol}://127.0.0.1:{config.port}/web")
     logger.info("=" * 50)
 
-    yield
 
+async def _on_cleanup(application: web.Application):
     stats_manager.stop_write_thread()
+    tasks = application.get('bg_tasks', [])
     for t in tasks:
         t.cancel()
     cache_manager.stop_cleaning_thread()
@@ -111,42 +106,77 @@ async def lifespan(application: FastAPI):
     logger.info("服务已停止")
 
 
+# ========== 中间件 ==========
+
+@web.middleware
+async def _cors_middleware(request: web.Request, handler):
+    if request.method == "OPTIONS":
+        response = web.Response()
+    else:
+        try:
+            response = await handler(request)
+        except web.HTTPException as exc:
+            response = exc
+    if isinstance(response, web.WebSocketResponse):
+        return response
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = '*'
+    response.headers['Access-Control-Allow-Headers'] = '*'
+    return response
+
+
 # ========== 创建应用 ==========
 
-def create_app() -> FastAPI:
-    application = FastAPI(lifespan=lifespan, log_level="info")
-    application.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False,
-                               allow_methods=["*"], allow_headers=["*"])
+def create_app() -> web.Application:
+    application = web.Application(middlewares=[_cors_middleware],
+                                  client_max_size=10 * 1024 ** 2)
+    application.on_startup.append(_on_startup)
+    application.on_cleanup.append(_on_cleanup)
 
-    # 注册路由
-    from modules.api.auth import router as auth_router
-    from modules.api.webhook import router as webhook_router
-    from modules.api.websocket import router as ws_router
-    from modules.api.admin import router as admin_router
+    from modules.api import admin, auth, webhook, websocket
 
-    application.include_router(auth_router)
-    application.include_router(webhook_router)
-    application.include_router(ws_router)
-    application.include_router(admin_router)
+    async def serve_root(request: web.Request) -> web.Response:
+        return web.json_response({"status": "ok", "message": "Webhook Bridge"})
 
-    # 根路径
-    @application.get("/")
-    async def serve_root():
-        return {"status": "ok", "message": "Webhook Bridge"}
-
-    # 静态资源 (必须在 SPA catch-all 之前注册)
-    assets_dir = os.path.join(WEB_DIR, "assets")
-    if os.path.isdir(assets_dir):
-        application.mount("/web/assets", StaticFiles(directory=assets_dir), name="assets")
-
-    # Vue SPA catch-all — /web 及 /web/... 均返回 index.html
-    @application.get("/web")
-    @application.get("/web/")
-    @application.get("/web/{path:path}")
-    async def serve_spa(request: Request, path: str = ""):
+    async def serve_spa(request: web.Request):
         index = os.path.join(WEB_DIR, "index.html")
         if os.path.isfile(index):
-            return FileResponse(index)
-        return {"status": "ok", "message": "Webhook Bridge"}
+            return web.FileResponse(index)
+        return web.json_response({"status": "ok", "message": "Webhook Bridge"})
+
+    router = application.router
+    router.add_get("/", serve_root)
+
+    # 认证
+    router.add_post("/api/admin/login", auth.admin_login)
+    router.add_get("/api/admin/verify", auth.verify_admin)
+    router.add_post("/api/admin/logout", auth.admin_logout)
+
+    # 管理
+    router.add_get("/api/admin/stats", admin.get_stats)
+    router.add_get("/api/admin/appids", admin.get_appids)
+    router.add_post("/api/admin/appids/create", admin.create_appid_post)
+    router.add_get("/api/admin/create_appid", admin.create_appid_get)
+    router.add_delete("/api/admin/appids/{appid}", admin.delete_appid)
+    router.add_get("/api/admin/settings", admin.get_settings)
+    router.add_post("/api/admin/settings/update", admin.update_settings)
+    router.add_post("/api/admin/webhook/add", admin.add_webhook)
+    router.add_post("/api/admin/webhook/remove", admin.remove_webhook)
+    router.add_get("/api/admin/db/tables", admin.db_list_tables)
+    router.add_get("/api/admin/db/table/{table_name}", admin.db_query_table)
+
+    # Webhook / WebSocket
+    router.add_post("/webhook", webhook.handle_webhook)
+    router.add_get("/ws/{secret}", websocket.websocket_endpoint)
+    router.add_get("/api/ws/{appid}", websocket.appid_websocket_endpoint)
+    # 动态 AppID 路由最后注册, 避免遮蔽 /api/admin/* 与 /api/ws/*
+    router.add_post("/api/{appid}", webhook.handle_appid_webhook)
+
+    # 静态资源 + Vue SPA catch-all
+    assets_dir = os.path.join(WEB_DIR, "assets")
+    if os.path.isdir(assets_dir):
+        router.add_static("/web/assets", assets_dir)
+    router.add_get("/web", serve_spa)
+    router.add_get("/web/{path:.*}", serve_spa)
 
     return application

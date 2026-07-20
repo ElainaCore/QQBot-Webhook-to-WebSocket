@@ -4,25 +4,26 @@ import logging
 import sqlite3
 import time
 from contextlib import closing
-from typing import Any, Dict
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from aiohttp import web
 
 from modules.core.config import config
 from modules.data import database as db
 from modules.net.connections import active_connections
-from modules.core.session import get_current_admin
+from modules.core.session import require_admin
 from modules.util.privacy import PrivacyUtils
 from modules.data.stats import stats_manager
 from modules.data.appid import app_id_manager
 
-router = APIRouter(prefix="/api/admin", tags=["admin"])
+
+def _err(status: int, detail: str) -> web.Response:
+    return web.json_response({"detail": detail}, status=status)
 
 
 # ========== 统计 ==========
 
-@router.get("/stats")
-async def get_stats(admin: str = Depends(get_current_admin)):
+async def get_stats(request: web.Request) -> web.Response:
+    require_admin(request)
     with stats_manager.stats_lock:
         stats_snap = {
             "ws": dict(stats_manager.stats.get("ws", {})),
@@ -49,7 +50,7 @@ async def get_stats(admin: str = Depends(get_current_admin)):
             "wh": data.get("wh", {}),
         }
 
-    return {
+    return web.json_response({
         "total_appids": len(app_id_manager.appids),
         "ws": stats_snap.get("ws", {}),
         "wh": stats_snap.get("wh", {}),
@@ -60,13 +61,13 @@ async def get_stats(admin: str = Depends(get_current_admin)):
         "webhook_enabled": (config.webhook_forward or {}).get("enabled", False),
         "per_secret": per_secret,
         "webhook_links_count": webhook_counts,
-    }
+    })
 
 
 # ========== AppID CRUD ==========
 
-@router.get("/appids")
-async def get_appids(admin: str = Depends(get_current_admin)):
+async def get_appids(request: web.Request) -> web.Response:
+    require_admin(request)
     with stats_manager.stats_lock:
         ps = stats_manager.stats.get("per_secret", {})
     result = []
@@ -78,95 +79,102 @@ async def get_appids(admin: str = Depends(get_current_admin)):
             "ws": ss.get("ws", {"success": 0, "failure": 0}),
             "wh": ss.get("wh", {"success": 0, "failure": 0}),
         })
-    return sorted(result, key=lambda x: x.get("create_time", 0), reverse=True)
+    return web.json_response(sorted(result, key=lambda x: x.get("create_time", 0), reverse=True))
 
 
-@router.post("/appids/create")
-async def create_appid_post(request: Request,
-                            admin: str = Depends(get_current_admin)):
+async def create_appid_post(request: web.Request) -> web.Response:
+    require_admin(request)
     try:
         data = await request.json()
     except:
-        raise HTTPException(status_code=400, detail="无效的JSON数据")
+        return _err(400, "无效的JSON数据")
     return _create_appid(data.get("appid", ""), data.get("secret", ""),
                          data.get("description", ""))
 
 
-@router.get("/create_appid")
-async def create_appid_get(appid: str = Query(...), secret: str = Query(...),
-                           description: str = Query(""),
-                           admin: str = Depends(get_current_admin)):
-    return _create_appid(appid, secret, description)
+async def create_appid_get(request: web.Request) -> web.Response:
+    require_admin(request)
+    appid = request.query.get("appid")
+    secret = request.query.get("secret")
+    if appid is None or secret is None:
+        return _err(400, "缺少appid或secret参数")
+    return _create_appid(appid, secret, request.query.get("description", ""))
 
 
 def _create_appid(appid, secret, description):
     if not appid or not appid.strip():
-        raise HTTPException(status_code=400, detail="AppID不能为空")
+        return _err(400, "AppID不能为空")
     if not secret or len(secret) < 10:
-        raise HTTPException(status_code=400, detail="密钥长度必须至少为10个字符")
+        return _err(400, "密钥长度必须至少为10个字符")
     ok, msg = app_id_manager.create_appid(appid.strip(), secret.strip(), description.strip())
     if not ok:
-        raise HTTPException(status_code=400, detail=f"创建AppID失败: {msg}")
-    return {"appid": appid, "secret": secret, "description": description,
-            "create_time": time.time(), "status": msg}
+        return _err(400, f"创建AppID失败: {msg}")
+    return web.json_response({"appid": appid, "secret": secret, "description": description,
+                              "create_time": time.time(), "status": msg})
 
 
-@router.delete("/appids/{appid}")
-async def delete_appid(appid: str, admin: str = Depends(get_current_admin)):
+async def delete_appid(request: web.Request) -> web.Response:
+    require_admin(request)
+    appid = request.match_info["appid"]
     if not app_id_manager.delete_appid(appid):
-        raise HTTPException(status_code=404, detail="AppID不存在")
-    return {"status": "success", "appid": appid}
+        return _err(404, "AppID不存在")
+    return web.json_response({"status": "success", "appid": appid})
 
 
 # ========== 设置 ==========
 
-@router.get("/settings")
-async def get_settings(admin: str = Depends(get_current_admin)):
-    return {
+async def get_settings(request: web.Request) -> web.Response:
+    require_admin(request)
+    return web.json_response({
         "log_level": config.log_level,
         "deduplication_ttl": config.deduplication_ttl,
         "raw_content": getattr(config, 'raw_content', {"enabled": False, "path": "logs"}),
         "ssl": config.ssl,
-    }
+    })
 
 
-@router.post("/settings/update")
-async def update_settings(data: Dict[str, Any],
-                          admin: str = Depends(get_current_admin)):
-    settings = data
+async def update_settings(request: web.Request) -> web.Response:
+    require_admin(request)
+    try:
+        settings = await request.json()
+    except:
+        return _err(400, "无效的JSON数据")
     if "raw_content" in settings:
         rc = settings["raw_content"]
         rc.setdefault("enabled", False)
         rc.setdefault("path", "logs")
         if not isinstance(rc.get("enabled"), bool):
-            raise HTTPException(status_code=400, detail="raw_content.enabled必须是布尔值")
+            return _err(400, "raw_content.enabled必须是布尔值")
         path = rc.get("path", "")
         if not path or ".." in path or path.startswith("/") or ":" in path:
-            raise HTTPException(status_code=400, detail="raw_content.path路径格式不安全")
+            return _err(400, "raw_content.path路径格式不安全")
     if "log_level" in settings and settings["log_level"] not in (
             "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
-        raise HTTPException(status_code=400, detail="无效的日志级别")
+        return _err(400, "无效的日志级别")
     config.update_settings(settings)
     if "log_level" in settings:
         logging.getLogger().setLevel(settings["log_level"])
     logging.info("管理员更新了系统设置")
-    return {"status": "success", "message": "系统设置已更新"}
+    return web.json_response({"status": "success", "message": "系统设置已更新"})
 
 
 # ========== Webhook 转发配置 ==========
 
-@router.post("/webhook/add")
-async def add_webhook(target: Dict[str, str],
-                      admin: str = Depends(get_current_admin)):
+async def add_webhook(request: web.Request) -> web.Response:
+    require_admin(request)
+    try:
+        target = await request.json()
+    except:
+        return _err(400, "无效的JSON数据")
     appid = target.get("appid", "").strip()
     url = target.get("url", "").strip()
     if not appid:
-        raise HTTPException(status_code=400, detail="请选择AppID")
+        return _err(400, "请选择AppID")
     if not url or not url.startswith(('http://', 'https://')):
-        raise HTTPException(status_code=400, detail="URL必须以http://或https://开头")
+        return _err(400, "URL必须以http://或https://开头")
     if any(t.get("appid") == appid and t["url"] == url
            for t in config.webhook_forward["targets"]):
-        raise HTTPException(status_code=400, detail="该转发配置已存在")
+        return _err(400, "该转发配置已存在")
     config.webhook_forward["targets"].append({"appid": appid, "url": url})
     try:
         config.save()
@@ -174,14 +182,17 @@ async def add_webhook(target: Dict[str, str],
         config.webhook_forward["targets"] = [
             t for t in config.webhook_forward["targets"]
             if not (t.get("appid") == appid and t["url"] == url)]
-        raise HTTPException(status_code=500, detail=f"保存配置失败: {e}")
+        return _err(500, f"保存配置失败: {e}")
     logging.info(f"添加Webhook转发: AppID:{appid} -> {url}")
-    return {"status": "success", "message": "Webhook转发配置已添加"}
+    return web.json_response({"status": "success", "message": "Webhook转发配置已添加"})
 
 
-@router.post("/webhook/remove")
-async def remove_webhook(target: Dict[str, str],
-                         admin: str = Depends(get_current_admin)):
+async def remove_webhook(request: web.Request) -> web.Response:
+    require_admin(request)
+    try:
+        target = await request.json()
+    except:
+        return _err(400, "无效的JSON数据")
     appid = target.get("appid", "")
     url = target.get("url", "")
     original = len(config.webhook_forward["targets"])
@@ -189,19 +200,19 @@ async def remove_webhook(target: Dict[str, str],
         t for t in config.webhook_forward["targets"]
         if not (t.get("appid") == appid and t["url"] == url)]
     if len(config.webhook_forward["targets"]) == original:
-        raise HTTPException(status_code=404, detail="未找到该转发配置")
+        return _err(404, "未找到该转发配置")
     try:
         config.save()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"保存配置失败: {e}")
+        return _err(500, f"保存配置失败: {e}")
     logging.info(f"删除Webhook转发: AppID:{appid} -> {url}")
-    return {"status": "success", "message": "Webhook转发配置已删除"}
+    return web.json_response({"status": "success", "message": "Webhook转发配置已删除"})
 
 
 # ========== 数据库查看 ==========
 
-@router.get("/db/tables")
-async def db_list_tables(admin: str = Depends(get_current_admin)):
+async def db_list_tables(request: web.Request) -> web.Response:
+    require_admin(request)
     with closing(sqlite3.connect(db.DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
         tables = [r[0] for r in conn.execute(
@@ -211,24 +222,28 @@ async def db_list_tables(admin: str = Depends(get_current_admin)):
             count = conn.execute(f"SELECT COUNT(*) FROM [{t}]").fetchone()[0]
             cols = [c[1] for c in conn.execute(f"PRAGMA table_info([{t}])").fetchall()]
             result.append({"name": t, "count": count, "columns": cols})
-    return result
+    return web.json_response(result)
 
 
-@router.get("/db/table/{table_name}")
-async def db_query_table(table_name: str, page: int = Query(1, ge=1),
-                         page_size: int = Query(50, ge=1, le=500),
-                         admin: str = Depends(get_current_admin)):
+async def db_query_table(request: web.Request) -> web.Response:
+    require_admin(request)
+    table_name = request.match_info["table_name"]
+    try:
+        page = max(1, int(request.query.get("page", 1)))
+        page_size = min(500, max(1, int(request.query.get("page_size", 50))))
+    except ValueError:
+        return _err(400, "无效的分页参数")
     with closing(sqlite3.connect(db.DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
         valid = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table_name,)).fetchone()
         if not valid:
-            raise HTTPException(status_code=404, detail="表不存在")
+            return _err(404, "表不存在")
         total = conn.execute(f"SELECT COUNT(*) FROM [{table_name}]").fetchone()[0]
         cols = [c[1] for c in conn.execute(f"PRAGMA table_info([{table_name}])").fetchall()]
         offset = (page - 1) * page_size
         rows = conn.execute(f"SELECT * FROM [{table_name}] LIMIT ? OFFSET ?",
                             (page_size, offset)).fetchall()
     data = [dict(r) for r in rows]
-    return {"table": table_name, "columns": cols, "rows": data,
-            "total": total, "page": page, "page_size": page_size}
+    return web.json_response({"table": table_name, "columns": cols, "rows": data,
+                              "total": total, "page": page, "page_size": page_size})

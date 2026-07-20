@@ -1,8 +1,4 @@
-﻿cryptography==43.0.3
-fastapi==0.115.5
-pydantic==2.9.2
-uvicorn==0.32.0
-websockets==14.0
+cryptography==43.0.3
 aiohttp==3.9.1
 pyyaml>=6.0
 uvloop>=0.19; sys_platform != "win32"

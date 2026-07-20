@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """AppID 管理器 — 内存缓存 + SQLite 持久化"""
+import hashlib
 import logging
 import threading
 import time
@@ -57,7 +58,10 @@ class AppIdManager:
 
     def verify_signature(self, appid: str, signature: str,
                          timestamp: str, nonce: str) -> bool:
-        return db.verify_appid_signature(appid, signature, timestamp, nonce)
+        secret = self.get_secret_by_appid(appid)
+        if not secret:
+            return False
+        return signature == hashlib.sha1((secret + timestamp + nonce).encode()).hexdigest()
 
 
 app_id_manager = AppIdManager()

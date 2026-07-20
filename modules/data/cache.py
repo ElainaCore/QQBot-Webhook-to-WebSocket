@@ -24,7 +24,7 @@ class MessageCacheManager:
 
     # ---------- 锁 ----------
 
-    async def get_lock_for_secret(self, secret: str) -> asyncio.Lock:
+    def get_lock_for_secret(self, secret: str) -> asyncio.Lock:
         lock = self.cache_locks.get(secret)
         if lock is None:
             lock = asyncio.Lock()
@@ -91,14 +91,14 @@ class MessageCacheManager:
         return q
 
     async def add_message(self, secret: str, data: bytes) -> bool:
-        lock = await self.get_lock_for_secret(secret)
+        lock = self.get_lock_for_secret(secret)
         async with lock:
             expiry = time.time() + config.cache["message_ttl"]
             self._ensure_cache(secret).append((expiry, data))
             return True
 
     async def get_messages(self, secret: str) -> list:
-        lock = await self.get_lock_for_secret(secret)
+        lock = self.get_lock_for_secret(secret)
         async with lock:
             q = self.message_cache.get(secret)
             if not q:
