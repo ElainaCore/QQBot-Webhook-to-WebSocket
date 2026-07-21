@@ -29,7 +29,7 @@ async def _handle_websocket(request: web.Request, secret: str) -> web.WebSocketR
         logging.info(f"WS连接 | 密钥:{PrivacyUtils.sanitize_secret(secret)} | "
                      f"连接数:{count}")
 
-        asyncio.create_task(resend_cache(secret, websocket))
+        resend_task = asyncio.create_task(resend_cache(secret, websocket))
         heartbeat_task = asyncio.create_task(send_heartbeat(websocket, secret))
 
         try:
@@ -52,6 +52,7 @@ async def _handle_websocket(request: web.Request, secret: str) -> web.WebSocketR
             logging.error(f"WS异常: {e}")
         finally:
             heartbeat_task.cancel()
+            resend_task.cancel()
             try:
                 await websocket.close()
             except Exception:
